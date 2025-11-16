@@ -267,10 +267,31 @@ python -c "from src.database.connection import DatabaseConnection; from src.util
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
+## Automation
+
+The scraper is configured to run automatically at midnight UTC every day using GitHub Actions.
+
+### Setting up Automation
+
+1. **Repository Secrets**: Add these secrets to your GitHub repository:
+   - `SUPABASE_URL`: Your Supabase project URL
+   - `SUPABASE_KEY`: Your Supabase anon key
+   - `USER_AGENT`: (Optional) Custom user agent string
+
+2. **GitHub Actions**: The workflow is already configured in `.github/workflows/midnight-scraper.yml` and will:
+   - Run daily at midnight UTC
+   - Install dependencies and Chrome
+   - Execute the full scraping pipeline
+   - Upload logs on failure
+   - Commit results (optional)
+
+3. **Manual Triggering**: You can also trigger the scraper manually from the Actions tab in GitHub.
+
 ## Support
 
 For issues and questions:
 
 1. Check the troubleshooting section
 2. Review the logs in `logs/scraper.log`
-3. Open an issue with detailed information about your setup and the error
+3. Check the GitHub Actions logs for automated runs
+4. Open an issue with detailed information about your setup and the error
