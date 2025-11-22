@@ -7,7 +7,7 @@ from urllib.parse import urljoin
 from loguru import logger
 
 from .browser import BrowserManager
-from ..utils.config import Config
+from src.utils.config import Config
 
 
 class ProductScraper:
