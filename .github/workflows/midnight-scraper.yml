@@ -50,15 +50,15 @@ jobs:
       run: |
         mkdir -p logs cache/embeddings
 
-    - name: Run scraper
-      env:
-        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        USER_AGENT: ${{ secrets.USER_AGENT || 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' }}
-        HEADLESS: true
-        LOG_LEVEL: INFO
-      run: |
-        python main.py --mode full
+        - name: Run scraper
+          env:
+            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+            SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+            USER_AGENT: ${{ secrets.USER_AGENT || 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' }}
+            HEADLESS: true
+            LOG_LEVEL: INFO
+          run: |
+            cd src && python main.py --mode full
 
     - name: Upload logs on failure
       if: failure()
