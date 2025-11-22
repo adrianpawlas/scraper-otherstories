@@ -51,7 +51,7 @@ class OtherStoriesScraper:
     BASE_URL = "https://www.stories.com"
     CATEGORY_URL = "https://www.stories.com/en-eu/clothing/"
     HEADERS = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -61,6 +61,9 @@ class OtherStoriesScraper:
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'none',
         'Sec-Fetch-User': '?1',
+        'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Linux"',
         'Cache-Control': 'max-age=0',
         'DNT': '1',
     }
@@ -79,6 +82,10 @@ class OtherStoriesScraper:
         self.test_mode = test_mode
         self.session = requests.Session()
         self.session.headers.update(self.HEADERS)
+        # Enable cookie handling
+        self.session.cookies.clear()
+        # Set some default cookies that might help
+        self.session.cookies.set('user_geolocation_country', 'EU', domain='.stories.com')
         
         # Initialize Supabase only if not in test mode
         if not test_mode:
@@ -114,34 +121,71 @@ class OtherStoriesScraper:
         for attempt in range(retries):
             try:
                 time.sleep(self.delay)
-                # Add Referer header for subsequent requests
+                # Build headers with Referer
                 headers = self.HEADERS.copy()
                 if attempt > 0 or hasattr(self, '_last_url'):
                     headers['Referer'] = getattr(self, '_last_url', self.BASE_URL)
+                else:
+                    # First request - visit homepage first to get cookies
+                    if not hasattr(self, '_homepage_visited'):
+                        try:
+                            logger.debug("Visiting homepage first to establish session...")
+                            home_headers = headers.copy()
+                            home_headers['Referer'] = ''
+                            self.session.get(self.BASE_URL, headers=home_headers, timeout=30)
+                            self._homepage_visited = True
+                            time.sleep(1)  # Small delay after homepage
+                        except:
+                            pass
+                    headers['Referer'] = self.BASE_URL
+                
+                headers['Origin'] = self.BASE_URL
                 
                 response = self.session.get(url, headers=headers, timeout=30, allow_redirects=True)
                 
-                # Check for 403 or other errors
+                # Check for 403 - try different strategies
                 if response.status_code == 403:
-                    logger.warning(f"403 Forbidden for {url}. Trying with different approach...")
-                    # Try with even more browser-like headers
-                    headers['Referer'] = self.BASE_URL
-                    headers['Origin'] = self.BASE_URL
-                    response = self.session.get(url, headers=headers, timeout=30, allow_redirects=True)
+                    logger.warning(f"403 Forbidden for {url}. Trying with enhanced headers...")
+                    # Strategy 1: More complete browser headers
+                    enhanced_headers = headers.copy()
+                    enhanced_headers.update({
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Cache-Control': 'no-cache',
+                        'Pragma': 'no-cache',
+                        'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                        'Sec-Ch-Ua-Mobile': '?0',
+                        'Sec-Ch-Ua-Platform': '"Linux"',
+                    })
+                    response = self.session.get(url, headers=enhanced_headers, timeout=30, allow_redirects=True)
+                    
+                    # Strategy 2: If still 403, try without some headers
+                    if response.status_code == 403:
+                        minimal_headers = {
+                            'User-Agent': self.HEADERS['User-Agent'],
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.5',
+                            'Accept-Encoding': 'gzip, deflate, br',
+                            'Connection': 'keep-alive',
+                            'Upgrade-Insecure-Requests': '1',
+                        }
+                        response = self.session.get(url, headers=minimal_headers, timeout=30, allow_redirects=True)
                 
                 response.raise_for_status()
                 self._last_url = url
                 return BeautifulSoup(response.content, 'lxml')
             except requests.exceptions.RequestException as e:
                 if attempt < retries - 1:
-                    wait_time = (attempt + 1) * 2
+                    wait_time = (attempt + 1) * 3  # Longer wait between retries
                     logger.warning(f"Retry {attempt + 1}/{retries} for {url} after {wait_time}s")
                     time.sleep(wait_time)
                 else:
                     logger.error(f"Error fetching {url} after {retries} attempts: {e}")
                     if hasattr(e, 'response') and e.response is not None:
                         logger.error(f"Response status: {e.response.status_code}")
-                        logger.error(f"Response headers: {dict(e.response.headers)}")
+                        # Don't log full headers in production to avoid clutter
+                        if logger.level <= logging.DEBUG:
+                            logger.error(f"Response headers: {dict(e.response.headers)}")
                     return None
         return None
     
