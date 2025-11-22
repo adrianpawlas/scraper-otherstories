@@ -1,0 +1,597 @@
+"""
+& Other Stories Scraper
+Scrapes all products, generates image embeddings, and imports to Supabase
+"""
+
+import os
+import time
+import json
+import requests
+from bs4 import BeautifulSoup
+from typing import List, Dict, Optional
+from urllib.parse import urljoin, urlparse, parse_qs
+import logging
+import re
+from datetime import datetime
+from dotenv import load_dotenv
+from tqdm import tqdm
+from supabase import create_client, Client
+from PIL import Image
+import io
+import numpy as np
+from transformers import AutoProcessor, AutoModel
+import torch
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class OtherStoriesScraper:
+    """Scraper for & Other Stories website"""
+    
+    BASE_URL = "https://www.stories.com"
+    CATEGORY_URL = "https://www.stories.com/en-eu/clothing/"
+    HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    }
+    
+    def __init__(self, supabase_url: str, supabase_key: str, delay: float = 1.5):
+        """
+        Initialize the scraper
+        
+        Args:
+            supabase_url: Supabase project URL
+            supabase_key: Supabase API key
+            delay: Delay between requests in seconds
+        """
+        self.delay = delay
+        self.session = requests.Session()
+        self.session.headers.update(self.HEADERS)
+        self.supabase: Client = create_client(supabase_url, supabase_key)
+        
+        # Initialize embedding model
+        logger.info("Loading embedding model...")
+        try:
+            self.processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-384")
+            self.embedding_model = AutoModel.from_pretrained("google/siglip-base-patch16-384")
+            self.embedding_model.eval()
+            # Move to GPU if available
+            if torch.cuda.is_available():
+                self.embedding_model = self.embedding_model.cuda()
+                logger.info("Using GPU for embeddings")
+            logger.info("Embedding model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading embedding model: {e}")
+            raise
+        
+    def get_page(self, url: str, retries: int = 3) -> Optional[BeautifulSoup]:
+        """Fetch and parse a page with retry logic"""
+        for attempt in range(retries):
+            try:
+                time.sleep(self.delay)
+                response = self.session.get(url, timeout=30)
+                response.raise_for_status()
+                return BeautifulSoup(response.content, 'lxml')
+            except requests.exceptions.RequestException as e:
+                if attempt < retries - 1:
+                    wait_time = (attempt + 1) * 2
+                    logger.warning(f"Retry {attempt + 1}/{retries} for {url} after {wait_time}s")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Error fetching {url} after {retries} attempts: {e}")
+                    return None
+        return None
+    
+    def get_products_from_category_page(self, category_url: str, page: int = 1) -> List[str]:
+        """
+        Extract all product URLs from a category page
+        
+        Args:
+            category_url: Base category URL
+            page: Page number (1-indexed)
+            
+        Returns:
+            List of product URLs
+        """
+        # Build URL with page parameter
+        if page > 1:
+            url = f"{category_url}?page={page}"
+        else:
+            url = category_url
+        
+        soup = self.get_page(url)
+        if not soup:
+            return []
+        
+        product_urls = []
+        
+        # Look for product links - they typically have /product/ in the href
+        # Try multiple selectors to be robust
+        selectors = [
+            'a[href*="/product/"]',
+            'a[href*="/en-eu/product/"]',
+            '.product-link',
+            '[data-product-url]',
+        ]
+        
+        for selector in selectors:
+            links = soup.select(selector)
+            if links:
+                for link in links:
+                    href = link.get('href', '')
+                    if '/product/' in href:
+                        # Make absolute URL if relative
+                        if href.startswith('/'):
+                            full_url = urljoin(self.BASE_URL, href)
+                        elif href.startswith('http'):
+                            full_url = href
+                        else:
+                            full_url = urljoin(url, href)
+                        
+                        # Clean URL (remove fragments, query params if needed)
+                        full_url = full_url.split('#')[0].split('?')[0]
+                        
+                        if full_url not in product_urls:
+                            product_urls.append(full_url)
+                break
+        
+        # Also try to find JSON-LD structured data
+        json_scripts = soup.find_all('script', type='application/ld+json')
+        for script in json_scripts:
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict) and 'url' in data:
+                    url_val = data['url']
+                    if '/product/' in url_val:
+                        product_urls.append(url_val)
+                elif isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and 'url' in item:
+                            url_val = item['url']
+                            if '/product/' in url_val:
+                                product_urls.append(url_val)
+            except:
+                pass
+        
+        logger.info(f"Found {len(product_urls)} products on page {page}")
+        return product_urls
+    
+    def get_all_product_urls(self) -> List[str]:
+        """
+        Get all product URLs from all pages of the category
+        
+        Returns:
+            List of all unique product URLs
+        """
+        all_urls = []
+        max_pages = 20  # User mentioned 20 pages
+        
+        for page in tqdm(range(1, max_pages + 1), desc="Discovering products"):
+            page_urls = self.get_products_from_category_page(self.CATEGORY_URL, page)
+            if not page_urls:
+                logger.info(f"No products found on page {page}, stopping pagination")
+                break
+            all_urls.extend(page_urls)
+            time.sleep(self.delay)
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_urls = []
+        for url in all_urls:
+            if url not in seen:
+                seen.add(url)
+                unique_urls.append(url)
+        
+        logger.info(f"Found {len(unique_urls)} unique products")
+        return unique_urls
+    
+    def scrape_product(self, product_url: str) -> Optional[Dict]:
+        """
+        Scrape a single product page and extract all information
+        
+        Args:
+            product_url: URL of the product page
+            
+        Returns:
+            Dictionary with product data or None if failed
+        """
+        soup = self.get_page(product_url)
+        if not soup:
+            return None
+        
+        try:
+            product_data = {
+                'source': 'scraper',
+                'brand': 'Other Stories',
+                'product_url': product_url,
+                'second_hand': False,
+                'gender': 'WOMAN',  # All products are for women according to user
+            }
+            
+            # Extract product ID from URL
+            # Format: /product/product-name-id/
+            match = re.search(r'/product/[^/]+-(\d+)/', product_url)
+            if match:
+                product_data['id'] = f"otherstories_{match.group(1)}"
+            else:
+                # Fallback: use URL hash or generate ID
+                product_data['id'] = f"otherstories_{hash(product_url) % 10**10}"
+            
+            # PRIORITY: Extract from JSON-LD structured data (most reliable)
+            json_ld_data = None
+            json_scripts = soup.find_all('script', type='application/ld+json')
+            for script in json_scripts:
+                try:
+                    data = json.loads(script.string)
+                    if isinstance(data, dict) and data.get('@type') == 'Product':
+                        json_ld_data = data
+                        break
+                except:
+                    continue
+            
+            # Extract data from JSON-LD if available
+            if json_ld_data:
+                # Title
+                product_data['title'] = json_ld_data.get('name', 'Unknown Product')
+                
+                # Price and currency from offers
+                offers = json_ld_data.get('offers', [])
+                if isinstance(offers, list) and offers:
+                    offer = offers[0]  # Take first offer
+                    product_data['price'] = float(offer.get('price', 0))
+                    product_data['currency'] = offer.get('priceCurrency', 'EUR')
+                elif isinstance(offers, dict):
+                    product_data['price'] = float(offers.get('price', 0))
+                    product_data['currency'] = offers.get('priceCurrency', 'EUR')
+                
+                # Image - take first image
+                images = json_ld_data.get('image', [])
+                if isinstance(images, list) and images:
+                    product_data['image_url'] = images[0]
+                elif isinstance(images, str):
+                    product_data['image_url'] = images
+                
+                # Description - clean HTML tags
+                description = json_ld_data.get('description', '')
+                if description:
+                    # Remove HTML tags
+                    desc_soup = BeautifulSoup(description, 'html.parser')
+                    product_data['description'] = desc_soup.get_text(separator=' ', strip=True)
+                
+                # Category
+                category_obj = json_ld_data.get('category', {})
+                if isinstance(category_obj, dict):
+                    category_name = category_obj.get('name', '')
+                    if category_name:
+                        # Extract main category (e.g., "Clothing > Knitwear > Sweaters" -> "Clothing")
+                        product_data['category'] = category_name.split('>')[0].strip()
+                    else:
+                        product_data['category'] = 'Clothing'
+                else:
+                    product_data['category'] = 'Clothing'
+                
+                # Brand
+                brand_obj = json_ld_data.get('brand', {})
+                if isinstance(brand_obj, dict):
+                    brand_name = brand_obj.get('name', '')
+                    if brand_name:
+                        product_data['brand'] = brand_name.replace('&', 'Other Stories').strip()
+                
+                # SKU for metadata
+                sku = json_ld_data.get('sku', '')
+            
+            else:
+                # FALLBACK: Extract from HTML/meta tags if JSON-LD not available
+                # Title
+                title = None
+                title_elem = soup.select_one('meta[property="og:title"]') or soup.find('title')
+                if title_elem:
+                    title = title_elem.get('content') if title_elem.name == 'meta' else title_elem.get_text(strip=True)
+                product_data['title'] = title or 'Unknown Product'
+                
+                # Price from meta tags
+                price_elem = soup.select_one('meta[property="product:price:amount"]')
+                currency_elem = soup.select_one('meta[property="product:price:currency"]')
+                if price_elem:
+                    try:
+                        product_data['price'] = float(price_elem.get('content', 0))
+                        product_data['currency'] = currency_elem.get('content', 'EUR') if currency_elem else 'EUR'
+                    except:
+                        product_data['price'] = None
+                        product_data['currency'] = 'EUR'
+                else:
+                    product_data['price'] = None
+                    product_data['currency'] = 'EUR'
+                
+                # Image from meta tags
+                image_elem = soup.select_one('meta[property="og:image"]')
+                if image_elem:
+                    product_data['image_url'] = image_elem.get('content', '')
+                else:
+                    # Try to find image in HTML
+                    img_elem = soup.select_one('img[src*="media.stories.com"]')
+                    if img_elem:
+                        product_data['image_url'] = img_elem.get('src', '') or img_elem.get('data-src', '')
+                
+                # Description
+                desc_elem = soup.select_one('meta[property="og:description"]')
+                if desc_elem:
+                    product_data['description'] = desc_elem.get('content', '')
+                else:
+                    product_data['description'] = None
+                
+                product_data['category'] = 'Clothing'
+                sku = None
+            
+            # Validate required fields
+            if not product_data.get('image_url'):
+                logger.warning(f"No image found for {product_url}")
+                return None
+            
+            # Make image URL absolute if needed
+            image_url = product_data['image_url']
+            if image_url.startswith('//'):
+                image_url = 'https:' + image_url
+            elif image_url.startswith('/'):
+                image_url = urljoin(self.BASE_URL, image_url)
+            elif not image_url.startswith('http'):
+                image_url = urljoin(product_url, image_url)
+            product_data['image_url'] = image_url
+            
+            # Extract sizes from offers (SKUs often indicate sizes)
+            sizes = []
+            if json_ld_data and 'offers' in json_ld_data:
+                offers = json_ld_data['offers']
+                if isinstance(offers, list):
+                    for offer in offers:
+                        sku_val = offer.get('sku', '')
+                        # SKU format often ends with size code (e.g., 1217076002002, 1217076002003)
+                        # Extract size if available in the offer
+                        if 'size' in offer:
+                            sizes.append(str(offer['size']))
+            
+            # Also try HTML selectors as fallback
+            if not sizes:
+                size_selectors = [
+                    '[data-size]',
+                    '.size-selector button',
+                    '.product-size option',
+                    'button[aria-label*="size"]',
+                ]
+                for selector in size_selectors:
+                    elems = soup.select(selector)
+                    for elem in elems:
+                        size_text = elem.get_text(strip=True) or elem.get('data-size', '') or elem.get('aria-label', '')
+                        if size_text and size_text.lower() not in ['select size', 'size'] and size_text not in sizes:
+                            sizes.append(size_text)
+                    if sizes:
+                        break
+            
+            product_data['size'] = ', '.join(sizes) if sizes else None
+            
+            # Build metadata object
+            metadata = {
+                'scraped_at': datetime.now().isoformat(),
+                'url': product_url,
+                'sizes_available': sizes,
+            }
+            
+            # Add additional info from JSON-LD
+            if json_ld_data:
+                if sku:
+                    metadata['sku'] = sku
+                if 'color' in json_ld_data:
+                    metadata['color'] = json_ld_data['color']
+                if 'aggregateRating' in json_ld_data:
+                    rating = json_ld_data['aggregateRating']
+                    if isinstance(rating, dict):
+                        metadata['rating'] = rating.get('ratingValue')
+                        metadata['review_count'] = rating.get('reviewCount')
+                if 'itemCondition' in json_ld_data:
+                    metadata['condition'] = json_ld_data['itemCondition']
+            
+            product_data['metadata'] = metadata
+            
+            return product_data
+            
+        except Exception as e:
+            logger.error(f"Error scraping product {product_url}: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
+    
+    def generate_embedding(self, image_url: str) -> Optional[List[float]]:
+        """
+        Generate 768-dimensional embedding for an image using google/siglip-base-patch16-384
+        
+        Args:
+            image_url: URL of the image
+            
+        Returns:
+            768-dimensional embedding vector or None if failed
+        """
+        try:
+            # Download image
+            response = self.session.get(image_url, timeout=30, stream=True)
+            response.raise_for_status()
+            image = Image.open(io.BytesIO(response.content)).convert('RGB')
+            
+            # Process image with the processor
+            inputs = self.processor(images=image, return_tensors="pt")
+            
+            # Move inputs to GPU if available
+            if torch.cuda.is_available():
+                inputs = {k: v.cuda() for k, v in inputs.items()}
+            
+            # Generate embedding
+            with torch.no_grad():
+                outputs = self.embedding_model(**inputs)
+                
+                # SigLIP models return BaseModelOutputWithPooling
+                # The image embeddings are in the pooler_output or last_hidden_state
+                if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
+                    embedding = outputs.pooler_output
+                elif hasattr(outputs, 'last_hidden_state'):
+                    # Take the CLS token (first token) from last_hidden_state
+                    embedding = outputs.last_hidden_state[:, 0, :]
+                elif hasattr(outputs, 'image_embeds'):
+                    embedding = outputs.image_embeds
+                else:
+                    # Fallback: try to get the first element
+                    if isinstance(outputs, tuple):
+                        embedding = outputs[0]
+                    else:
+                        embedding = outputs
+                
+                # Get the embedding tensor and convert to numpy
+                if isinstance(embedding, torch.Tensor):
+                    embedding = embedding.cpu().numpy()
+                
+                # Handle batch dimension - take first item if batch
+                if len(embedding.shape) > 1:
+                    embedding = embedding[0] if embedding.shape[0] == 1 else embedding[0]
+                
+                # SigLIP base-patch16-384 should produce 768-dim embeddings
+                # If dimension doesn't match, log warning
+                if len(embedding) != 768:
+                    logger.warning(f"Embedding dimension is {len(embedding)}, expected 768 for {image_url}")
+                    # For siglip-base-patch16-384, it should be 768, but if not, we'll handle it
+                    if len(embedding) > 768:
+                        embedding = embedding[:768]
+                    elif len(embedding) < 768:
+                        # Pad with zeros if smaller (shouldn't happen with this model)
+                        embedding = np.pad(embedding, (0, 768 - len(embedding)))
+                
+                # Normalize the embedding (common practice for similarity search)
+                embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
+                
+                return embedding.tolist()
+        except Exception as e:
+            logger.error(f"Error generating embedding for {image_url}: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
+    
+    def insert_product(self, product_data: Dict) -> bool:
+        """
+        Insert product into Supabase
+        
+        Args:
+            product_data: Dictionary containing product information
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Prepare data for Supabase - match exact schema
+            supabase_data = {
+                'id': product_data.get('id'),
+                'source': product_data.get('source', 'scraper'),
+                'product_url': product_data.get('product_url'),
+                'affiliate_url': product_data.get('affiliate_url'),  # Optional
+                'image_url': product_data.get('image_url'),
+                'brand': product_data.get('brand', 'Other Stories'),
+                'title': product_data.get('title'),
+                'description': product_data.get('description'),  # Optional
+                'category': product_data.get('category'),  # Optional
+                'gender': product_data.get('gender', 'WOMAN'),
+                'price': product_data.get('price'),
+                'currency': product_data.get('currency'),
+                'size': product_data.get('size'),  # Optional
+                'second_hand': product_data.get('second_hand', False),
+                'metadata': json.dumps(product_data.get('metadata', {})) if product_data.get('metadata') else None,
+                'embedding': product_data.get('embedding'),  # Vector type in Supabase
+                'created_at': datetime.now().isoformat(),
+            }
+            
+            # Remove None values for optional fields (let database use defaults)
+            supabase_data = {k: v for k, v in supabase_data.items() if v is not None}
+            
+            # Insert/update into Supabase (upsert based on source + product_url unique constraint)
+            result = self.supabase.table('products').upsert(supabase_data).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error inserting product {product_data.get('id')}: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return False
+    
+    def run(self):
+        """Main scraping loop"""
+        logger.info("Starting & Other Stories scraper...")
+        logger.info(f"Category URL: {self.CATEGORY_URL}")
+        
+        # Get all product URLs from all pages
+        all_product_urls = self.get_all_product_urls()
+        
+        if not all_product_urls:
+            logger.error("No products found! Check the website structure.")
+            return
+        
+        logger.info(f"Found {len(all_product_urls)} unique products to scrape")
+        
+        # Scrape each product
+        successful = 0
+        failed = 0
+        
+        for product_url in tqdm(all_product_urls, desc="Scraping products"):
+            try:
+                product_data = self.scrape_product(product_url)
+                if product_data:
+                    # Generate embedding
+                    if product_data.get('image_url'):
+                        logger.debug(f"Generating embedding for {product_data.get('title', 'product')}")
+                        embedding = self.generate_embedding(product_data['image_url'])
+                        if embedding:
+                            product_data['embedding'] = embedding
+                        else:
+                            logger.warning(f"Failed to generate embedding for {product_url}")
+                    
+                    # Insert into database
+                    if self.insert_product(product_data):
+                        successful += 1
+                    else:
+                        failed += 1
+                else:
+                    failed += 1
+                    logger.warning(f"Failed to scrape product: {product_url}")
+            except Exception as e:
+                failed += 1
+                logger.error(f"Unexpected error processing {product_url}: {e}")
+        
+        logger.info(f"Scraping completed! Success: {successful}, Failed: {failed}")
+
+
+if __name__ == "__main__":
+    # Get Supabase credentials from environment variables
+    # For local development, use .env file
+    # For GitHub Actions, use secrets: SUPABASE_URL and SUPABASE_KEY
+    supabase_url = os.getenv('SUPABASE_URL')
+    supabase_key = os.getenv('SUPABASE_KEY')
+    
+    # Fallback to defaults for local development (remove in production)
+    if not supabase_url:
+        supabase_url = 'https://yqawmzggcgpeyaaynrjk.supabase.co'
+    if not supabase_key:
+        supabase_key = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlxYXdtemdnY2dwZXlhYXlucmprIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTAxMDkyNiwiZXhwIjoyMDcwNTg2OTI2fQ.XtLpxausFriraFJeX27ZzsdQsFv3uQKXBBggoz6P4D4'
+    
+    if not supabase_url or not supabase_key:
+        logger.error("Please set SUPABASE_URL and SUPABASE_KEY as environment variables or in .env file")
+        exit(1)
+    
+    # Initialize scraper with 1.5 second delay between requests
+    scraper = OtherStoriesScraper(supabase_url, supabase_key, delay=1.5)
+    scraper.run()
+
