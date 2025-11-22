@@ -5,11 +5,11 @@ import argparse
 import sys
 from pathlib import Path
 
-# Add src to path
+# Add src to path for proper module resolution
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
-from scraper.orchestrator import ScrapingOrchestrator
-from utils.logger import get_logger
+from src.scraper.orchestrator import ScrapingOrchestrator
+from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
