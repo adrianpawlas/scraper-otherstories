@@ -5,8 +5,6 @@ on:
     # Run at midnight UTC every day (adjust timezone as needed)
     - cron: '0 0 * * *'
   workflow_dispatch: # Allow manual triggering
-  push:
-    branches: [ main, master ]
 
 jobs:
   scrape-and-update:
