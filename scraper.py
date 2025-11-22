@@ -404,7 +404,7 @@ class OtherStoriesScraper:
                     product_data['price'] = float(offers.get('price', 0))
                     product_data['currency'] = offers.get('priceCurrency', 'EUR')
                 
-                # Image - take first image
+                # Image - take first image from JSON-LD
                 images = json_ld_data.get('image', [])
                 if isinstance(images, list) and images:
                     product_data['image_url'] = images[0]
@@ -439,6 +439,59 @@ class OtherStoriesScraper:
                 
                 # SKU for metadata
                 sku = json_ld_data.get('sku', '')
+            
+            # If no image found in JSON-LD, try comprehensive fallback methods
+            if not product_data.get('image_url'):
+                # Try meta tags (multiple sources)
+                image_selectors = [
+                    'meta[property="og:image"]',
+                    'meta[name="twitter:image"]',
+                    'meta[itemprop="image"]',
+                    'link[rel="image_src"]',
+                ]
+                for selector in image_selectors:
+                    image_elem = soup.select_one(selector)
+                    if image_elem:
+                        img_url = image_elem.get('content') or image_elem.get('href')
+                        if img_url and ('media.stories.com' in img_url or img_url.startswith('http')):
+                            product_data['image_url'] = img_url
+                            break
+                
+                # Try finding images in HTML (multiple selectors)
+                if not product_data.get('image_url'):
+                    img_selectors = [
+                        'img[src*="media.stories.com"]',
+                        'img[data-src*="media.stories.com"]',
+                        'img[data-lazy-src*="media.stories.com"]',
+                        '.product-image img',
+                        '.product-gallery img',
+                        '[data-product-image] img',
+                        '[class*="product"] img[src*="media"]',
+                        'picture img',
+                        'source[srcset*="media.stories.com"]',
+                    ]
+                    for selector in img_selectors:
+                        img_elem = soup.select_one(selector)
+                        if img_elem:
+                            img_url = (img_elem.get('src') or 
+                                      img_elem.get('data-src') or 
+                                      img_elem.get('data-lazy-src') or
+                                      img_elem.get('srcset', '').split(',')[0].strip().split(' ')[0] if img_elem.get('srcset') else None)
+                            if img_url and 'media.stories.com' in img_url:
+                                product_data['image_url'] = img_url
+                                break
+                
+                # Last resort: try to find any image with media.stories.com
+                if not product_data.get('image_url'):
+                    all_imgs = soup.find_all('img')
+                    for img in all_imgs:
+                        for attr in ['src', 'data-src', 'data-lazy-src']:
+                            img_url = img.get(attr, '')
+                            if img_url and 'media.stories.com' in img_url:
+                                product_data['image_url'] = img_url
+                                break
+                        if product_data.get('image_url'):
+                            break
             
             else:
                 # FALLBACK: Extract from HTML/meta tags if JSON-LD not available
@@ -484,9 +537,10 @@ class OtherStoriesScraper:
                 sku = None
             
             # Validate required fields
+            # Note: image_url is required for embeddings, but we can still save products without images
             if not product_data.get('image_url'):
-                logger.warning(f"No image found for {product_url}")
-                return None
+                logger.warning(f"No image found for {product_url} - product will be saved without embedding")
+                # Don't return None - allow product to be saved without image/embedding
             
             # Make image URL absolute if needed
             image_url = product_data['image_url']
