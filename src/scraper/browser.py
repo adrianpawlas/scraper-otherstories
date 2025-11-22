@@ -12,7 +12,7 @@ import time
 from typing import Optional, Any
 from loguru import logger
 
-from utils.config import Config
+from ..utils.config import Config
 
 
 class BrowserManager:

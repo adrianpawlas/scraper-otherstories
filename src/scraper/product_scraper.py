@@ -6,8 +6,8 @@ from typing import Dict, Any, Optional, List
 from urllib.parse import urljoin
 from loguru import logger
 
-from scraper.browser import BrowserManager
-from utils.config import Config
+from .browser import BrowserManager
+from ..utils.config import Config
 
 
 class ProductScraper:

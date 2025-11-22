@@ -6,8 +6,8 @@ from typing import List, Dict, Any, Optional
 from urllib.parse import urljoin, urlparse
 from loguru import logger
 
-from scraper.browser import BrowserManager
-from utils.config import Config
+from .browser import BrowserManager
+from ..utils.config import Config
 
 
 class CategoryScraper:

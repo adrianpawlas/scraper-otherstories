@@ -5,7 +5,7 @@ from typing import Dict, List, Any, Optional
 from supabase import create_client, Client
 from loguru import logger
 
-from utils.config import Config
+from ..utils.config import Config
 
 
 class DatabaseConnection:

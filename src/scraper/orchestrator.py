@@ -6,13 +6,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from loguru import logger
 
-from scraper.browser import BrowserManager
-from scraper.category_scraper import CategoryScraper
-from scraper.product_scraper import ProductScraper
-from database.connection import DatabaseConnection
-from embeddings.service import EmbeddingService
-from utils.config import Config
-from utils.logger import setup_logging
+from .browser import BrowserManager
+from .category_scraper import CategoryScraper
+from .product_scraper import ProductScraper
+from ..database.connection import DatabaseConnection
+from ..embeddings.service import EmbeddingService
+from ..utils.config import Config
+from ..utils.logger import setup_logging
 
 
 class ScrapingOrchestrator:
