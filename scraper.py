@@ -189,20 +189,33 @@ class OtherStoriesScraper:
                 # Check for 403 - try different strategies
                 if response.status_code == 403:
                     logger.warning(f"403 Forbidden for {url}. Trying with enhanced headers...")
-                    # Strategy 1: More complete browser headers
+                    # Strategy 1: More complete browser headers with Sec-Fetch headers
                     enhanced_headers = headers.copy()
                     enhanced_headers.update({
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
                         'Accept-Language': 'en-US,en;q=0.9',
-                        'Cache-Control': 'no-cache',
-                        'Pragma': 'no-cache',
+                        'Cache-Control': 'max-age=0',
                         'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
                         'Sec-Ch-Ua-Mobile': '?0',
                         'Sec-Ch-Ua-Platform': '"Linux"',
+                        'Sec-Fetch-Dest': 'document',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-Site': 'same-origin' if 'stories.com' in url else 'none',
+                        'Sec-Fetch-User': '?1',
                     })
                     response = self.session.get(url, headers=enhanced_headers, timeout=30, allow_redirects=True)
                     
-                    # Strategy 2: If still 403, try without some headers
+                    # Strategy 2: If still 403, try re-establishing session
+                    if response.status_code == 403:
+                        logger.warning("403 persists, re-establishing session...")
+                        try:
+                            self.visit_homepage_to_get_cookies()
+                            time.sleep(2)
+                            response = self.session.get(url, headers=enhanced_headers, timeout=30, allow_redirects=True)
+                        except Exception:
+                            pass
+                    
+                    # Strategy 3: If still 403, try minimal headers
                     if response.status_code == 403:
                         minimal_headers = {
                             'User-Agent': self.HEADERS['User-Agent'],
@@ -326,21 +339,24 @@ class OtherStoriesScraper:
                 break
             all_urls.extend(page_urls)
             
-            # Remove duplicates while preserving order
-            seen = set()
-            unique_urls = []
-            for url in all_urls:
-                if url not in seen:
-                    seen.add(url)
-                    unique_urls.append(url)
-            
-            # Check if we've reached the limit
-            if limit and len(unique_urls) >= limit:
-                unique_urls = unique_urls[:limit]
-                logger.info(f"Reached limit of {limit} products")
+            # Check if we've reached the limit (before deduplication)
+            if limit and len(all_urls) >= limit:
                 break
             
             time.sleep(self.delay)
+        
+        # Remove duplicates while preserving order (after collecting all URLs)
+        seen = set()
+        unique_urls = []
+        for url in all_urls:
+            if url not in seen:
+                seen.add(url)
+                unique_urls.append(url)
+        
+        # Apply limit after deduplication
+        if limit and len(unique_urls) > limit:
+            unique_urls = unique_urls[:limit]
+            logger.info(f"Reached limit of {limit} products")
         
         logger.info(f"Found {len(unique_urls)} unique products")
         return unique_urls
@@ -771,9 +787,86 @@ class OtherStoriesScraper:
             logger.debug(traceback.format_exc())
             return False
     
+    def delete_missing_products(self, current_product_ids: List[str]):
+        """
+        Delete products from database that are no longer in the current scrape
+        
+        Args:
+            current_product_ids: List of product IDs that were successfully scraped
+        """
+        if self.test_mode:
+            logger.info(f"TEST MODE: Would delete products not in current scrape (keeping {len(current_product_ids)} products)")
+            return
+        
+        try:
+            # Fetch all existing product IDs for this source
+            endpoint = f"{self.supabase_url}/rest/v1/products"
+            params = {
+                'source': 'eq.scraper',
+                'select': 'id'
+            }
+            
+            resp = self.supabase_session.get(endpoint, params=params, timeout=60)
+            resp.raise_for_status()
+            
+            existing_ids = [item.get('id') for item in resp.json() if item.get('id')]
+            current_ids_set = set(current_product_ids)
+            
+            # Find IDs to delete (exist in DB but not in current scrape)
+            to_delete = [eid for eid in existing_ids if eid not in current_ids_set]
+            
+            if not to_delete:
+                logger.info("No products to delete - all existing products are still present")
+                return
+            
+            logger.info(f"Found {len(to_delete)} products to delete (not in current scrape)")
+            
+            # Delete in chunks using Supabase's 'in' operator for bulk deletes
+            chunk_size = 100
+            deleted_count = 0
+            
+            for i in range(0, len(to_delete), chunk_size):
+                chunk = to_delete[i:i + chunk_size]
+                try:
+                    del_endpoint = f"{self.supabase_url}/rest/v1/products"
+                    # Use 'in' operator for bulk delete: id=in.(id1,id2,id3)
+                    ids_str = ','.join(chunk)
+                    del_params = {
+                        'source': 'eq.scraper',
+                        'id': f'in.({ids_str})'
+                    }
+                    del_resp = self.supabase_session.delete(del_endpoint, params=del_params, timeout=60)
+                    if del_resp.status_code in (200, 204):
+                        deleted_count += len(chunk)
+                        logger.debug(f"Deleted {len(chunk)} products (chunk {i//chunk_size + 1})")
+                    else:
+                        logger.warning(f"Failed to delete chunk: {del_resp.status_code} {del_resp.text}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete chunk {i//chunk_size + 1}: {e}")
+                    # Fallback: delete one by one if bulk delete fails
+                    for product_id in chunk:
+                        try:
+                            del_endpoint = f"{self.supabase_url}/rest/v1/products"
+                            del_params = {
+                                'source': 'eq.scraper',
+                                'id': f'eq.{product_id}'
+                            }
+                            del_resp = self.supabase_session.delete(del_endpoint, params=del_params, timeout=60)
+                            if del_resp.status_code in (200, 204):
+                                deleted_count += 1
+                        except Exception as e2:
+                            logger.warning(f"Failed to delete product {product_id}: {e2}")
+            
+            logger.info(f"Deleted {deleted_count} old products from database")
+            
+        except Exception as e:
+            logger.error(f"Error during sync cleanup: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+    
     def run(self, product_limit: Optional[int] = None):
         """
-        Main scraping loop
+        Main scraping loop with sync functionality
         
         Args:
             product_limit: Maximum number of products to scrape (None for all)
@@ -782,6 +875,14 @@ class OtherStoriesScraper:
         logger.info(f"Category URL: {self.CATEGORY_URL}")
         if product_limit:
             logger.info(f"Product limit: {product_limit}")
+        
+        # Visit homepage first to establish session and get cookies (helps with 403)
+        logger.info("Visiting homepage to establish session...")
+        try:
+            self.visit_homepage_to_get_cookies()
+            time.sleep(2)  # Small delay after establishing session
+        except Exception as e:
+            logger.warning(f"Failed to visit homepage (continuing anyway): {e}")
         
         # Get all product URLs from all pages
         all_product_urls = self.get_all_product_urls(limit=product_limit)
@@ -792,14 +893,17 @@ class OtherStoriesScraper:
         
         logger.info(f"Found {len(all_product_urls)} unique products to scrape")
         
-        # Scrape each product
+        # Scrape each product and track successful IDs
         successful = 0
         failed = 0
+        successful_product_ids = []  # Track IDs for sync
         
         for product_url in tqdm(all_product_urls, desc="Scraping products"):
             try:
                 product_data = self.scrape_product(product_url)
                 if product_data:
+                    product_id = product_data.get('id')
+                    
                     # Generate embedding (skip in test mode)
                     if not self.test_mode and product_data.get('image_url'):
                         logger.debug(f"Generating embedding for {product_data.get('title', 'product')}")
@@ -809,11 +913,15 @@ class OtherStoriesScraper:
                         else:
                             logger.warning(f"Failed to generate embedding for {product_url}")
                     
-                    # Insert into database (skip in test mode)
+                    # Insert/update into database (skip in test mode)
                     if self.test_mode:
                         logger.info(f"TEST MODE: Would insert product: {product_data.get('title', 'Unknown')} - {product_data.get('price', 'N/A')} {product_data.get('currency', '')}")
+                        if product_id:
+                            successful_product_ids.append(product_id)
                         successful += 1
                     elif self.insert_product(product_data):
+                        if product_id:
+                            successful_product_ids.append(product_id)
                         successful += 1
                     else:
                         failed += 1
@@ -825,6 +933,12 @@ class OtherStoriesScraper:
                 logger.error(f"Unexpected error processing {product_url}: {e}")
         
         logger.info(f"Scraping completed! Success: {successful}, Failed: {failed}")
+        
+        # Sync: Delete products that are no longer in the current scrape
+        if not self.test_mode and successful_product_ids:
+            logger.info("Starting database sync - removing old products...")
+            self.delete_missing_products(successful_product_ids)
+            logger.info("Database sync completed!")
 
 
 if __name__ == "__main__":
