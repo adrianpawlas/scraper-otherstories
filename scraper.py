@@ -19,11 +19,23 @@ from supabase import create_client, Client
 from PIL import Image
 import io
 import numpy as np
-from transformers import AutoProcessor, AutoModel
-import torch
 
 # Load environment variables
 load_dotenv()
+
+# Check if we're in test mode before importing heavy dependencies
+import sys
+TEST_MODE = '--test' in sys.argv or os.getenv('TEST_MODE', '').lower() == 'true'
+
+# Import transformers only when not in test mode
+TRANSFORMERS_AVAILABLE = False
+if not TEST_MODE:
+    try:
+        from transformers import AutoProcessor, AutoModel
+        import torch
+        TRANSFORMERS_AVAILABLE = True
+    except ImportError:
+        TRANSFORMERS_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -40,14 +52,20 @@ class OtherStoriesScraper:
     CATEGORY_URL = "https://www.stories.com/en-eu/clothing/"
     HEADERS = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'gzip, deflate, br',
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0',
+        'DNT': '1',
     }
     
-    def __init__(self, supabase_url: str, supabase_key: str, delay: float = 1.5):
+    def __init__(self, supabase_url: str, supabase_key: str, delay: float = 1.5, test_mode: bool = False):
         """
         Initialize the scraper
         
@@ -55,34 +73,64 @@ class OtherStoriesScraper:
             supabase_url: Supabase project URL
             supabase_key: Supabase API key
             delay: Delay between requests in seconds
+            test_mode: If True, skip embeddings and database insertion
         """
         self.delay = delay
+        self.test_mode = test_mode
         self.session = requests.Session()
         self.session.headers.update(self.HEADERS)
-        self.supabase: Client = create_client(supabase_url, supabase_key)
         
-        # Initialize embedding model
-        logger.info("Loading embedding model...")
-        try:
-            self.processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-384")
-            self.embedding_model = AutoModel.from_pretrained("google/siglip-base-patch16-384")
-            self.embedding_model.eval()
-            # Move to GPU if available
-            if torch.cuda.is_available():
-                self.embedding_model = self.embedding_model.cuda()
-                logger.info("Using GPU for embeddings")
-            logger.info("Embedding model loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading embedding model: {e}")
-            raise
+        # Initialize Supabase only if not in test mode
+        if not test_mode:
+            self.supabase: Client = create_client(supabase_url, supabase_key)
+        else:
+            self.supabase = None
+            logger.info("TEST MODE: Skipping database operations")
+        
+        # Initialize embedding model only if not in test mode
+        if not test_mode:
+            if not TRANSFORMERS_AVAILABLE:
+                raise ImportError("transformers library is required but not available. Install with: pip install transformers torch")
+            logger.info("Loading embedding model...")
+            try:
+                self.processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-384")
+                self.embedding_model = AutoModel.from_pretrained("google/siglip-base-patch16-384")
+                self.embedding_model.eval()
+                # Move to GPU if available
+                if torch.cuda.is_available():
+                    self.embedding_model = self.embedding_model.cuda()
+                    logger.info("Using GPU for embeddings")
+                logger.info("Embedding model loaded successfully")
+            except Exception as e:
+                logger.error(f"Error loading embedding model: {e}")
+                raise
+        else:
+            self.processor = None
+            self.embedding_model = None
+            logger.info("TEST MODE: Skipping embedding model loading")
         
     def get_page(self, url: str, retries: int = 3) -> Optional[BeautifulSoup]:
         """Fetch and parse a page with retry logic"""
         for attempt in range(retries):
             try:
                 time.sleep(self.delay)
-                response = self.session.get(url, timeout=30)
+                # Add Referer header for subsequent requests
+                headers = self.HEADERS.copy()
+                if attempt > 0 or hasattr(self, '_last_url'):
+                    headers['Referer'] = getattr(self, '_last_url', self.BASE_URL)
+                
+                response = self.session.get(url, headers=headers, timeout=30, allow_redirects=True)
+                
+                # Check for 403 or other errors
+                if response.status_code == 403:
+                    logger.warning(f"403 Forbidden for {url}. Trying with different approach...")
+                    # Try with even more browser-like headers
+                    headers['Referer'] = self.BASE_URL
+                    headers['Origin'] = self.BASE_URL
+                    response = self.session.get(url, headers=headers, timeout=30, allow_redirects=True)
+                
                 response.raise_for_status()
+                self._last_url = url
                 return BeautifulSoup(response.content, 'lxml')
             except requests.exceptions.RequestException as e:
                 if attempt < retries - 1:
@@ -91,6 +139,9 @@ class OtherStoriesScraper:
                     time.sleep(wait_time)
                 else:
                     logger.error(f"Error fetching {url} after {retries} attempts: {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        logger.error(f"Response status: {e.response.status_code}")
+                        logger.error(f"Response headers: {dict(e.response.headers)}")
                     return None
         return None
     
@@ -550,8 +601,8 @@ class OtherStoriesScraper:
             try:
                 product_data = self.scrape_product(product_url)
                 if product_data:
-                    # Generate embedding
-                    if product_data.get('image_url'):
+                    # Generate embedding (skip in test mode)
+                    if not self.test_mode and product_data.get('image_url'):
                         logger.debug(f"Generating embedding for {product_data.get('title', 'product')}")
                         embedding = self.generate_embedding(product_data['image_url'])
                         if embedding:
@@ -559,8 +610,11 @@ class OtherStoriesScraper:
                         else:
                             logger.warning(f"Failed to generate embedding for {product_url}")
                     
-                    # Insert into database
-                    if self.insert_product(product_data):
+                    # Insert into database (skip in test mode)
+                    if self.test_mode:
+                        logger.info(f"TEST MODE: Would insert product: {product_data.get('title', 'Unknown')} - {product_data.get('price', 'N/A')} {product_data.get('currency', '')}")
+                        successful += 1
+                    elif self.insert_product(product_data):
                         successful += 1
                     else:
                         failed += 1
@@ -575,6 +629,16 @@ class OtherStoriesScraper:
 
 
 if __name__ == "__main__":
+    # Check for test mode flag (already checked at module level)
+    test_mode = TEST_MODE
+    
+    if test_mode:
+        logger.info("=" * 60)
+        logger.info("RUNNING IN TEST MODE")
+        logger.info("- Skipping embedding generation")
+        logger.info("- Skipping database insertion")
+        logger.info("=" * 60)
+    
     # Get Supabase credentials from environment variables
     # For local development, use .env file
     # For GitHub Actions, use secrets: SUPABASE_URL and SUPABASE_KEY
@@ -587,11 +651,11 @@ if __name__ == "__main__":
     if not supabase_key:
         supabase_key = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlxYXdtemdnY2dwZXlhYXlucmprIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTAxMDkyNiwiZXhwIjoyMDcwNTg2OTI2fQ.XtLpxausFriraFJeX27ZzsdQsFv3uQKXBBggoz6P4D4'
     
-    if not supabase_url or not supabase_key:
+    if not test_mode and (not supabase_url or not supabase_key):
         logger.error("Please set SUPABASE_URL and SUPABASE_KEY as environment variables or in .env file")
         exit(1)
     
     # Initialize scraper with 1.5 second delay between requests
-    scraper = OtherStoriesScraper(supabase_url, supabase_key, delay=1.5)
+    scraper = OtherStoriesScraper(supabase_url, supabase_key, delay=1.5, test_mode=test_mode)
     scraper.run()
 
