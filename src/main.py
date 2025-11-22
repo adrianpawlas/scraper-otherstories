@@ -5,9 +5,9 @@ import argparse
 import sys
 from pathlib import Path
 
-# Use relative imports to work when run as a module
-from .scraper.orchestrator import ScrapingOrchestrator
-from .utils.logger import get_logger
+# Use absolute imports from src package
+from src.scraper.orchestrator import ScrapingOrchestrator
+from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
