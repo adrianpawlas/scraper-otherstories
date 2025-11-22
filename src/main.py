@@ -5,6 +5,12 @@ import argparse
 import sys
 from pathlib import Path
 
+# Add project root to Python path to ensure src package can be imported
+# When running as a module (python -m src.main), we need the parent directory in path
+project_root = Path(__file__).parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 # Use absolute imports from src package
 from src.scraper.orchestrator import ScrapingOrchestrator
 from src.utils.logger import get_logger
