@@ -245,6 +245,28 @@ class OtherStoriesScraper:
                     return None
         return None
     
+    def visit_homepage_to_get_cookies(self):
+        """
+        Visit the homepage to establish a session and get cookies.
+        This helps avoid 403 errors by making the scraper look more like a real browser.
+        """
+        try:
+            headers = self.HEADERS.copy()
+            headers['Referer'] = ''
+            headers['Sec-Fetch-Site'] = 'none'
+            headers['Sec-Fetch-Mode'] = 'navigate'
+            headers['Sec-Fetch-Dest'] = 'document'
+            headers['Sec-Fetch-User'] = '?1'
+            
+            response = self.session.get(self.BASE_URL, headers=headers, timeout=30, allow_redirects=True)
+            response.raise_for_status()
+            self._homepage_visited = True
+            logger.debug("Successfully visited homepage and established session")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to visit homepage: {e}")
+            return False
+    
     def get_products_from_category_page(self, category_url: str, page: int = 1) -> List[str]:
         """
         Extract all product URLs from a category page
