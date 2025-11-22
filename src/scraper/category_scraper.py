@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urlparse
 from loguru import logger
 
 from .browser import BrowserManager
-from src.utils.config import Config
+from ..utils.config import Config
 
 
 class CategoryScraper:
