@@ -2,12 +2,8 @@
 """Main entry point for the & Other Stories scraper."""
 
 import sys
-from pathlib import Path
-
-# Import and run the main module from src
-sys.path.insert(0, str(Path(__file__).parent / 'src'))
-
-from main import main
+import subprocess
 
 if __name__ == '__main__':
-    main()
+    # Run as a module to ensure proper package structure
+    sys.exit(subprocess.run([sys.executable, '-m', 'src.main'] + sys.argv[1:]).returncode)

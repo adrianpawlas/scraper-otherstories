@@ -5,10 +5,9 @@ import argparse
 import sys
 from pathlib import Path
 
-# Since we're now in src directory, the package structure should work naturally
-
-from scraper.orchestrator import ScrapingOrchestrator
-from utils.logger import get_logger
+# Use relative imports to work when run as a module
+from .scraper.orchestrator import ScrapingOrchestrator
+from .utils.logger import get_logger
 
 logger = get_logger(__name__)
 

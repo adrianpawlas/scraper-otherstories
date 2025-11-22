@@ -58,7 +58,7 @@ jobs:
         HEADLESS: true
         LOG_LEVEL: INFO
       run: |
-        cd src && python main.py --mode full
+        python -m src.main --mode full
 
     - name: Upload logs on failure
       if: failure()
