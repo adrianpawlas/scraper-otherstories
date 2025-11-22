@@ -15,7 +15,7 @@ import re
 from datetime import datetime
 from dotenv import load_dotenv
 from tqdm import tqdm
-from supabase import create_client, Client
+# Removed supabase client import - using REST API directly
 from PIL import Image
 import io
 import numpy as np
@@ -27,15 +27,48 @@ load_dotenv()
 import sys
 TEST_MODE = '--test' in sys.argv or os.getenv('TEST_MODE', '').lower() == 'true'
 
-# Import transformers only when not in test mode
+# Import transformers only when not in test mode (lazy import)
 TRANSFORMERS_AVAILABLE = False
-if not TEST_MODE:
+AutoProcessor = None
+AutoModel = None
+torch = None
+
+def _import_transformers():
+    """Lazy import of transformers - only when needed"""
+    global TRANSFORMERS_AVAILABLE, AutoProcessor, AutoModel, torch
+    if TRANSFORMERS_AVAILABLE:
+        return True
     try:
-        from transformers import AutoProcessor, AutoModel
-        import torch
+        # Try importing torch first to check compatibility
+        import torch as t
+        torch = t
+        
+        # Use SiglipProcessor and SiglipModel directly (more reliable)
+        from transformers import SiglipProcessor, SiglipModel
+        AutoProcessor = SiglipProcessor
+        AutoModel = SiglipModel
         TRANSFORMERS_AVAILABLE = True
-    except ImportError:
-        TRANSFORMERS_AVAILABLE = False
+        return True
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "torchvision" in error_msg or "nms" in error_msg:
+            logger.error("=" * 60)
+            logger.error("TORCH/TORCHVISION COMPATIBILITY ERROR")
+            logger.error("This is a known issue with Python 3.13 and certain torch versions.")
+            logger.error("Try: pip install --upgrade torch torchvision")
+            logger.error("Or use Python 3.11 instead.")
+            logger.error("=" * 60)
+        logger.error(f"Runtime error importing transformers: {e}")
+        return False
+    except ImportError as e:
+        logger.error(f"Failed to import transformers: {e}")
+        logger.error("Install with: pip install transformers torch torchvision")
+        return False
+    except Exception as e:
+        logger.error(f"Error importing transformers: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
+        return False
 
 # Configure logging
 logging.basicConfig(
@@ -87,27 +120,37 @@ class OtherStoriesScraper:
         # Set some default cookies that might help
         self.session.cookies.set('user_geolocation_country', 'EU', domain='.stories.com')
         
-        # Initialize Supabase only if not in test mode
+        # Initialize Supabase REST client (direct REST API, not Python client)
         if not test_mode:
-            self.supabase: Client = create_client(supabase_url, supabase_key)
+            self.supabase_url = supabase_url.rstrip("/")
+            self.supabase_key = supabase_key
+            self.supabase_session = requests.Session()
+            self.supabase_session.headers.update({
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type": "application/json",
+            })
         else:
-            self.supabase = None
+            self.supabase_url = None
+            self.supabase_key = None
+            self.supabase_session = None
             logger.info("TEST MODE: Skipping database operations")
         
         # Initialize embedding model only if not in test mode
         if not test_mode:
-            if not TRANSFORMERS_AVAILABLE:
+            if not _import_transformers():
                 raise ImportError("transformers library is required but not available. Install with: pip install transformers torch")
             logger.info("Loading embedding model...")
             try:
-                self.processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-384")
-                self.embedding_model = AutoModel.from_pretrained("google/siglip-base-patch16-384")
+                model_name = "google/siglip-base-patch16-384"
+                self.processor = AutoProcessor.from_pretrained(model_name)
+                self.embedding_model = AutoModel.from_pretrained(model_name)
                 self.embedding_model.eval()
                 # Move to GPU if available
                 if torch.cuda.is_available():
                     self.embedding_model = self.embedding_model.cuda()
                     logger.info("Using GPU for embeddings")
-                logger.info("Embedding model loaded successfully")
+                logger.info(f"Embedding model {model_name} loaded successfully")
             except Exception as e:
                 logger.error(f"Error loading embedding model: {e}")
                 raise
@@ -263,9 +306,12 @@ class OtherStoriesScraper:
         logger.info(f"Found {len(product_urls)} products on page {page}")
         return product_urls
     
-    def get_all_product_urls(self) -> List[str]:
+    def get_all_product_urls(self, limit: Optional[int] = None) -> List[str]:
         """
         Get all product URLs from all pages of the category
+        
+        Args:
+            limit: Maximum number of products to return (None for all)
         
         Returns:
             List of all unique product URLs
@@ -279,15 +325,22 @@ class OtherStoriesScraper:
                 logger.info(f"No products found on page {page}, stopping pagination")
                 break
             all_urls.extend(page_urls)
+            
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_urls = []
+            for url in all_urls:
+                if url not in seen:
+                    seen.add(url)
+                    unique_urls.append(url)
+            
+            # Check if we've reached the limit
+            if limit and len(unique_urls) >= limit:
+                unique_urls = unique_urls[:limit]
+                logger.info(f"Reached limit of {limit} products")
+                break
+            
             time.sleep(self.delay)
-        
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_urls = []
-        for url in all_urls:
-            if url not in seen:
-                seen.add(url)
-                unique_urls.append(url)
         
         logger.info(f"Found {len(unique_urls)} unique products")
         return unique_urls
@@ -518,13 +571,52 @@ class OtherStoriesScraper:
             768-dimensional embedding vector or None if failed
         """
         try:
-            # Download image
-            response = self.session.get(image_url, timeout=30, stream=True)
-            response.raise_for_status()
-            image = Image.open(io.BytesIO(response.content)).convert('RGB')
+            # Clean up URL
+            raw_url = str(image_url).strip()
+            if raw_url.startswith("//"):
+                raw_url = "https:" + raw_url
             
-            # Process image with the processor
-            inputs = self.processor(images=image, return_tensors="pt")
+            # Download image with proper headers (like working scraper)
+            # Request JPEG/PNG instead of AVIF to avoid PIL compatibility issues
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'image/webp,image/apng,image/jpeg,image/png,image/*,*/*;q=0.8',  # Prefer JPEG/PNG over AVIF
+                'Referer': self.BASE_URL,
+            }
+            
+            # Use fresh requests call for images
+            resp = requests.get(raw_url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            
+            # Try to open as image directly from response content
+            try:
+                img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+                image = img
+            except Exception as e:
+                # If still AVIF, try requesting JPEG version explicitly
+                content_type = resp.headers.get('Content-Type', '').lower()
+                if 'avif' in content_type:
+                    # Try to get JPEG version by modifying Accept header
+                    headers_jpg = headers.copy()
+                    headers_jpg['Accept'] = 'image/jpeg,image/png,*/*;q=0.8'
+                    try:
+                        resp2 = requests.get(raw_url, headers=headers_jpg, timeout=15)
+                        if resp2.status_code == 200 and 'image/jpeg' in resp2.headers.get('Content-Type', '').lower():
+                            img = Image.open(io.BytesIO(resp2.content)).convert('RGB')
+                            image = img
+                        else:
+                            logger.warning(f"AVIF image not supported by PIL, and JPEG fallback unavailable: {raw_url}")
+                            return None
+                    except Exception as e2:
+                        logger.warning(f"Failed to get JPEG version of image: {raw_url}, error: {e2}")
+                        return None
+                else:
+                    logger.warning(f"Failed to open image from {raw_url}: {e}")
+                    return None
+            
+            # Process image with SigLIP processor (requires both image and text inputs)
+            # SigLIP is a vision-language model, so it needs text input even if empty
+            inputs = self.processor(images=image, text=[""], return_tensors="pt")
             
             # Move inputs to GPU if available
             if torch.cuda.is_available():
@@ -534,45 +626,21 @@ class OtherStoriesScraper:
             with torch.no_grad():
                 outputs = self.embedding_model(**inputs)
                 
-                # SigLIP models return BaseModelOutputWithPooling
-                # The image embeddings are in the pooler_output or last_hidden_state
-                if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
-                    embedding = outputs.pooler_output
-                elif hasattr(outputs, 'last_hidden_state'):
-                    # Take the CLS token (first token) from last_hidden_state
-                    embedding = outputs.last_hidden_state[:, 0, :]
-                elif hasattr(outputs, 'image_embeds'):
-                    embedding = outputs.image_embeds
-                else:
-                    # Fallback: try to get the first element
-                    if isinstance(outputs, tuple):
-                        embedding = outputs[0]
-                    else:
-                        embedding = outputs
+                # SigLIP returns image_embeds directly
+                embedding = outputs.image_embeds.squeeze()
                 
-                # Get the embedding tensor and convert to numpy
+                # Get the embedding tensor and convert to list
                 if isinstance(embedding, torch.Tensor):
-                    embedding = embedding.cpu().numpy()
+                    embedding = embedding.cpu().tolist()
+                elif isinstance(embedding, np.ndarray):
+                    embedding = embedding.tolist()
                 
-                # Handle batch dimension - take first item if batch
-                if len(embedding.shape) > 1:
-                    embedding = embedding[0] if embedding.shape[0] == 1 else embedding[0]
-                
-                # SigLIP base-patch16-384 should produce 768-dim embeddings
-                # If dimension doesn't match, log warning
+                # Verify dimensions (should be exactly 768)
                 if len(embedding) != 768:
-                    logger.warning(f"Embedding dimension is {len(embedding)}, expected 768 for {image_url}")
-                    # For siglip-base-patch16-384, it should be 768, but if not, we'll handle it
-                    if len(embedding) > 768:
-                        embedding = embedding[:768]
-                    elif len(embedding) < 768:
-                        # Pad with zeros if smaller (shouldn't happen with this model)
-                        embedding = np.pad(embedding, (0, 768 - len(embedding)))
+                    logger.warning(f"Embedding dimension mismatch: got {len(embedding)}, expected 768 for {image_url}")
+                    return None
                 
-                # Normalize the embedding (common practice for similarity search)
-                embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
-                
-                return embedding.tolist()
+                return embedding
         except Exception as e:
             logger.error(f"Error generating embedding for {image_url}: {e}")
             import traceback
@@ -581,7 +649,7 @@ class OtherStoriesScraper:
     
     def insert_product(self, product_data: Dict) -> bool:
         """
-        Insert product into Supabase
+        Insert product into Supabase using direct REST API (like working scraper)
         
         Args:
             product_data: Dictionary containing product information
@@ -589,6 +657,10 @@ class OtherStoriesScraper:
         Returns:
             True if successful, False otherwise
         """
+        if self.test_mode:
+            logger.info(f"TEST MODE: Would insert product: {product_data.get('title', 'Unknown')} - {product_data.get('price', 'N/A')} {product_data.get('currency', '')}")
+            return True
+        
         try:
             # Prepare data for Supabase - match exact schema
             supabase_data = {
@@ -607,15 +679,37 @@ class OtherStoriesScraper:
                 'size': product_data.get('size'),  # Optional
                 'second_hand': product_data.get('second_hand', False),
                 'metadata': json.dumps(product_data.get('metadata', {})) if product_data.get('metadata') else None,
-                'embedding': product_data.get('embedding'),  # Vector type in Supabase
                 'created_at': datetime.now().isoformat(),
             }
+            
+            # Add embedding if available (Supabase vector type expects array format)
+            embedding = product_data.get('embedding')
+            if embedding:
+                # Format as PostgreSQL array string: [0.1,0.2,...]
+                embedding_str = '[' + ','.join(map(str, embedding)) + ']'
+                supabase_data['embedding'] = embedding_str
             
             # Remove None values for optional fields (let database use defaults)
             supabase_data = {k: v for k, v in supabase_data.items() if v is not None}
             
-            # Insert/update into Supabase (upsert based on source + product_url unique constraint)
-            result = self.supabase.table('products').upsert(supabase_data).execute()
+            # Use REST API directly (same pattern as working scraper)
+            endpoint = f"{self.supabase_url}/rest/v1/products"
+            headers = {
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            }
+            
+            resp = self.supabase_session.post(
+                endpoint,
+                headers=headers,
+                data=json.dumps(supabase_data),
+                timeout=60
+            )
+            
+            if resp.status_code not in (200, 201, 204):
+                error_msg = f"Supabase upsert failed: {resp.status_code} {resp.text}"
+                logger.error(f"Error inserting product {product_data.get('id')}: {error_msg}")
+                return False
+            
             return True
         except Exception as e:
             logger.error(f"Error inserting product {product_data.get('id')}: {e}")
@@ -623,13 +717,20 @@ class OtherStoriesScraper:
             logger.debug(traceback.format_exc())
             return False
     
-    def run(self):
-        """Main scraping loop"""
+    def run(self, product_limit: Optional[int] = None):
+        """
+        Main scraping loop
+        
+        Args:
+            product_limit: Maximum number of products to scrape (None for all)
+        """
         logger.info("Starting & Other Stories scraper...")
         logger.info(f"Category URL: {self.CATEGORY_URL}")
+        if product_limit:
+            logger.info(f"Product limit: {product_limit}")
         
         # Get all product URLs from all pages
-        all_product_urls = self.get_all_product_urls()
+        all_product_urls = self.get_all_product_urls(limit=product_limit)
         
         if not all_product_urls:
             logger.error("No products found! Check the website structure.")
@@ -673,8 +774,19 @@ class OtherStoriesScraper:
 
 
 if __name__ == "__main__":
+    import sys
+    
     # Check for test mode flag (already checked at module level)
     test_mode = TEST_MODE
+    
+    # Check for product limit
+    product_limit = None
+    if '--limit' in sys.argv:
+        try:
+            limit_idx = sys.argv.index('--limit')
+            product_limit = int(sys.argv[limit_idx + 1])
+        except (IndexError, ValueError):
+            logger.warning("Invalid --limit value, ignoring")
     
     if test_mode:
         logger.info("=" * 60)
@@ -701,5 +813,5 @@ if __name__ == "__main__":
     
     # Initialize scraper with 1.5 second delay between requests
     scraper = OtherStoriesScraper(supabase_url, supabase_key, delay=1.5, test_mode=test_mode)
-    scraper.run()
+    scraper.run(product_limit=product_limit)
 
